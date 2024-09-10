@@ -1,4 +1,4 @@
-module telemetry_server
+module telemetry
 
 go 1.22.5
 
