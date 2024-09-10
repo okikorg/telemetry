@@ -15,7 +15,6 @@ func main() {
 	log.Println("Starting telemetry service...")
 
 	r := gin.Default()
-	r.Use(gin.Logger())
 
 	// Initialize routes
 	initializeRoutes(r)
