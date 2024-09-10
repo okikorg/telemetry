@@ -12,10 +12,21 @@ import (
 )
 
 func main() {
-	r := gin.Default()
+	log.Println("Starting telemetry service...")
 
+	r := gin.Default()
 	r.Use(gin.Logger())
 
+	// Initialize routes
+	initializeRoutes(r)
+
+	log.Println("Routes initialized. Starting server on :8080")
+	if err := r.Run(":8080"); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func initializeRoutes(r *gin.Engine) {
 	r.GET("/", func(c *gin.Context) {
 		log.Println("Received request to /")
 		c.JSON(http.StatusOK, gin.H{
@@ -23,72 +34,97 @@ func main() {
 		})
 	})
 
-	r.GET("/cpu-info", func(c *gin.Context) {
-		cpuUtil, err := cpu.Percent(0, false)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get CPU utilization"})
-			return
-		}
+	r.GET("/cpu-info", getCPUInfo)
+	r.GET("/system-load", getSystemLoad)
+	r.GET("/gpu-info", getGPUInfo)
+}
 
-		memInfo, err := mem.VirtualMemory()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get memory information"})
-			return
-		}
+func getCPUInfo(c *gin.Context) {
+	cpuUtil, err := cpu.Percent(0, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get CPU utilization"})
+		return
+	}
 
-		response := gin.H{
-			"cpu_utilization":    fmt.Sprintf("%.2f%%", cpuUtil[0]),
-			"memory_utilization": fmt.Sprintf("%.2f%%", memInfo.UsedPercent),
-			"total_memory":       fmt.Sprintf("%d MB", memInfo.Total/1024/1024),
-			"used_memory":        fmt.Sprintf("%d MB", memInfo.Used/1024/1024),
-			"free_memory":        fmt.Sprintf("%d MB", memInfo.Free/1024/1024),
-		}
+	memInfo, err := mem.VirtualMemory()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get memory information"})
+		return
+	}
 
-		c.JSON(http.StatusOK, response)
+	response := gin.H{
+		"cpu_utilization":    fmt.Sprintf("%.2f%%", cpuUtil[0]),
+		"memory_utilization": fmt.Sprintf("%.2f%%", memInfo.UsedPercent),
+		"total_memory":       fmt.Sprintf("%d MB", memInfo.Total/1024/1024),
+		"used_memory":        fmt.Sprintf("%d MB", memInfo.Used/1024/1024),
+		"free_memory":        fmt.Sprintf("%d MB", memInfo.Free/1024/1024),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func getSystemLoad(c *gin.Context) {
+	cpuUtil, err := cpu.Percent(0, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get CPU utilization"})
+		return
+	}
+
+	memInfo, err := mem.VirtualMemory()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get memory information"})
+		return
+	}
+
+	load := (cpuUtil[0] + memInfo.UsedPercent) / 2
+
+	gpuInfo, err := getGPUInfoInternal()
+	if err != nil {
+		log.Printf("Error getting GPU info: %v", err)
+	} else if gpuInfo != nil {
+		load = (load + gpuInfo.GPUUtilization) / 2
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"load": fmt.Sprintf("%.2f%%", load),
 	})
+}
 
-	r.GET("/system-load", func(c *gin.Context) {
-		cpuUtil, err := cpu.Percent(0, false)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get CPU utilization"})
-			return
-		}
+func getGPUInfoInternal() (*GPUInfo, error) {
+	ret := nvml.Init()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("Failed to initialize NVML")
+	}
+	defer nvml.Shutdown()
 
-		memInfo, err := mem.VirtualMemory()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get memory information"})
-			return
-		}
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("Unable to get device count")
+	}
 
-		load := (cpuUtil[0] + memInfo.UsedPercent) / 2
+	if count == 0 {
+		return nil, nil
+	}
 
-		gpuInfo := getGPUInfo()
-		if gpuInfo != nil {
-			load = (load + gpuInfo.GPUUtilization) / 2
-		}
+	device, ret := nvml.DeviceGetHandleByIndex(0)
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("Unable to get device handle")
+	}
 
-		c.JSON(http.StatusOK, gin.H{
-			"load": fmt.Sprintf("%.2f%%", load),
-		})
-	})
+	memInfo, ret := device.GetMemoryInfo()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("Unable to get memory info")
+	}
 
-	r.GET("/gpu-info", func(c *gin.Context) {
-		gpuInfo := getGPUInfo()
-		if gpuInfo == nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get GPU information"})
-			return
-		}
+	utilization, ret := device.GetUtilizationRates()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("Unable to get utilization rates")
+	}
 
-		response := gin.H{
-			"gpu_memory_utilization": fmt.Sprintf("%.2f%%", gpuInfo.MemoryUtilization),
-			"gpu_utilization":        fmt.Sprintf("%.2f%%", gpuInfo.GPUUtilization),
-		}
-
-		c.JSON(http.StatusOK, response)
-	})
-
-	log.Println("Starting server on :8080")
-	r.Run(":8080")
+	return &GPUInfo{
+		MemoryUtilization: float64(memInfo.Used) / float64(memInfo.Total) * 100,
+		GPUUtilization:    float64(utilization.Gpu),
+	}, nil
 }
 
 type GPUInfo struct {
@@ -96,44 +132,18 @@ type GPUInfo struct {
 	GPUUtilization    float64
 }
 
-func getGPUInfo() *GPUInfo {
-	ret := nvml.Init()
-	if ret != nvml.SUCCESS {
-		log.Println("Failed to initialize NVML")
-		return nil
+func getGPUInfo(c *gin.Context) {
+	gpuInfo, err := getGPUInfoInternal()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
-	defer nvml.Shutdown()
-
-	count, ret := nvml.DeviceGetCount()
-	if ret != nvml.SUCCESS {
-		log.Println("Unable to get device count")
-		return nil
+	if gpuInfo == nil {
+		c.JSON(http.StatusOK, gin.H{"message": "No GPU information available"})
+		return
 	}
-
-	if count == 0 {
-		return nil
-	}
-
-	device, ret := nvml.DeviceGetHandleByIndex(0)
-	if ret != nvml.SUCCESS {
-		log.Println("Unable to get device handle")
-		return nil
-	}
-
-	memInfo, ret := device.GetMemoryInfo()
-	if ret != nvml.SUCCESS {
-		log.Println("Unable to get memory info")
-		return nil
-	}
-
-	utilization, ret := device.GetUtilizationRates()
-	if ret != nvml.SUCCESS {
-		log.Println("Unable to get utilization rates")
-		return nil
-	}
-
-	return &GPUInfo{
-		MemoryUtilization: float64(memInfo.Used) / float64(memInfo.Total) * 100,
-		GPUUtilization:    float64(utilization.Gpu),
-	}
+	c.JSON(http.StatusOK, gin.H{
+		"memory_utilization": fmt.Sprintf("%.2f%%", gpuInfo.MemoryUtilization),
+		"gpu_utilization":    fmt.Sprintf("%.2f%%", gpuInfo.GPUUtilization),
+	})
 }
